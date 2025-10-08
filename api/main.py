@@ -1,20 +1,18 @@
-# main.py
+# main.py — FastAPI backend for Render
 import os
 import asyncio
 import textwrap
+import hashlib
+import time
 from typing import Optional, Literal, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-from openai import OpenAI  # OpenAI Python SDK v1+
+from openai import OpenAI  # v1 SDK
 
-# --------------------------- Config ---------------------------
-
-# Default small/cost-effective model; change if you prefer.
+# ---------- Config ----------
 DEFAULT_MODEL = "gpt-4o-mini"
-
-# Very safe character-based chunking so big selections don't 413/timeout
 MAX_CHARS_PER_CHUNK = 3500
 REQUEST_TIMEOUT_S = 60
 
@@ -24,16 +22,11 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-app = FastAPI(title="Summarize API", version="1.2.0")
+app = FastAPI(title="Summarize API", version="1.3.0")
 
-# Lock CORS to your Chrome extension in production.
-# Find your ID at chrome://extensions and set EXT_ID env var in Render.
+# Lock CORS to your extension in prod by setting EXT_ID in Render env
 EXT_ID = os.getenv("EXT_ID", "").strip()
-if EXT_ID:
-    ALLOWED_ORIGINS = [f"chrome-extension://{EXT_ID}"]
-else:
-    # While developing, it's fine to stay open. Tighten before shipping.
-    ALLOWED_ORIGINS = ["*"]
+ALLOWED_ORIGINS = [f"chrome-extension://{EXT_ID}"] if EXT_ID else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,8 +36,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------- Schemas ---------------------------
+# Simple in-memory cache (per instance)
+CACHE_TTL_S = 600
+_cache: dict[str, tuple[float, str]] = {}
 
+def cache_get(key: str) -> Optional[str]:
+    item = _cache.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if time.time() - ts > CACHE_TTL_S:
+        _cache.pop(key, None)
+        return None
+    return val
+
+def cache_set(key: str, value: str) -> None:
+    _cache[key] = (time.time(), value)
+
+# ---------- Models ----------
 Tone = Literal["precise", "casual", "bullet", "academic"]
 
 class SummarizeRequest(BaseModel):
@@ -62,22 +71,18 @@ class SummarizeRequest(BaseModel):
 
 class SummarizeResponse(BaseModel):
     summary: str
-    # You can add metadata fields if you like (model, chunks, tokens_used, etc.)
 
-# --------------------------- Utils ---------------------------
-
+# ---------- Helpers ----------
 def tone_instruction(tone: Tone, n: int) -> str:
     if tone == "bullet":
         return f"Summarize the content in at most {n} concise bullet points."
     return f"Summarize the content in at most {n} sentences with a {tone} tone."
 
 def chunk_text(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> List[str]:
-    """Split text on paragraph boundaries first, then hard-wrap long paragraphs."""
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    paras = [p.strip() for p in text.split("\n") if p.strip()]
     chunks: List[str] = []
     buf = ""
-
-    for p in paragraphs:
+    for p in paras:
         if len(buf) + len(p) + 1 <= max_chars:
             buf = (buf + "\n" + p).strip()
         else:
@@ -86,17 +91,15 @@ def chunk_text(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> List[str]:
             if len(p) <= max_chars:
                 buf = p
             else:
-                # Extremely long single paragraph: hard-slice
+                # very long single paragraph
                 for i in range(0, len(p), max_chars):
-                    pieces = p[i : i + max_chars]
+                    piece = p[i : i + max_chars]
                     if buf:
                         chunks.append(buf)
                         buf = ""
-                    chunks.append(pieces)
-
+                    chunks.append(piece)
     if buf:
         chunks.append(buf)
-
     return chunks or [""]
 
 async def call_openai_with_timeout(prompt: str, model: str) -> str:
@@ -117,7 +120,6 @@ async def call_openai_with_timeout(prompt: str, model: str) -> str:
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Upstream model timed out")
     except Exception as e:
-        # Map common issues to friendlier HTTP errors
         msg = str(e)
         if "insufficient_quota" in msg or "Rate limit" in msg:
             raise HTTPException(status_code=429, detail="OpenAI quota or rate limit")
@@ -125,26 +127,32 @@ async def call_openai_with_timeout(prompt: str, model: str) -> str:
             raise HTTPException(status_code=401, detail="OpenAI authentication failed")
         raise HTTPException(status_code=502, detail="OpenAI upstream error")
 
-# --------------------------- Routes ---------------------------
-
+# ---------- Routes ----------
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": DEFAULT_MODEL}
+    return {"ok": True, "model": DEFAULT_MODEL, "cache_size": len(_cache)}
 
 @app.post("/summarize", response_model=SummarizeResponse)
 async def summarize(req: SummarizeRequest) -> SummarizeResponse:
     model = req.model or DEFAULT_MODEL
     instr = tone_instruction(req.tone, req.maxSentences)
 
+    # cache key
+    digest_input = f"{req.tone}|{req.maxSentences}|{req.text}"
+    cache_key = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+    cached = cache_get(cache_key)
+    if cached:
+        return SummarizeResponse(summary=cached)
+
     parts = chunk_text(req.text)
 
-    # Single-shot for short inputs
     if len(parts) == 1:
         prompt = f"{instr}\n\n---\n{parts[0]}"
         out = await call_openai_with_timeout(prompt, model)
+        cache_set(cache_key, out)
         return SummarizeResponse(summary=out)
 
-    # Multi-stage for long inputs: summarize each chunk, then synthesize
+    # Multi-stage: summarize chunks, then synthesize
     partials: List[str] = []
     for i, ch in enumerate(parts, start=1):
         prompt = f"{instr}\n\n(Part {i} of {len(parts)})\n\n---\n{ch}"
@@ -154,7 +162,7 @@ async def summarize(req: SummarizeRequest) -> SummarizeResponse:
         f"""
         {instr}
         You are given partial summaries of several parts of a longer text.
-        Merge them into ONE cohesive summary. Eliminate redundancy and keep it tight.
+        Merge them into one cohesive summary. Remove redundancy.
 
         PARTIAL SUMMARIES:
         {"".join(f"- {p}\n" for p in partials)}
@@ -162,4 +170,5 @@ async def summarize(req: SummarizeRequest) -> SummarizeResponse:
     ).strip()
 
     final = await call_openai_with_timeout(synthesis, model)
+    cache_set(cache_key, final)
     return SummarizeResponse(summary=final)
