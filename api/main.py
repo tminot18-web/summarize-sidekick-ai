@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from psycopg_pool import AsyncConnectionPool
-from psycopg.rows import dict_row
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_REQ_PER_MIN = int(os.getenv("MAX_REQ_PER_MIN", "60"))
@@ -56,7 +55,7 @@ async def init_db():
     global POOL
     if not DATABASE_URL:
         return
-    POOL = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, kwargs={"row_factory": dict_row})
+    POOL = AsyncConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5)
     async with POOL.connection() as conn:
         async with conn.transaction():
             await conn.execute(DDL)
