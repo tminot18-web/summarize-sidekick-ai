@@ -1,174 +1,327 @@
-# main.py — FastAPI backend for Render
+# main.py
 import os
-import asyncio
-import textwrap
-import hashlib
 import time
-from typing import Optional, Literal, List
+import json
+import hashlib
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
-from openai import OpenAI  # v1 SDK
+from fastapi.responses import JSONResponse, HTMLResponse
+from pydantic import BaseModel, Field
+from openai import OpenAI
 
-# ---------- Config ----------
-DEFAULT_MODEL = "gpt-4o-mini"
-MAX_CHARS_PER_CHUNK = 3500
-REQUEST_TIMEOUT_S = 60
+# ---- Config ----
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_REQ_PER_MIN = int(os.getenv("MAX_REQ_PER_MIN", "60"))
+WINDOW_SEC = 60
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not set")
+EXT_IDS = [s.strip() for s in os.getenv("EXT_IDS", "").split(",") if s.strip()]
+ALLOWED_ORIGINS = [f"chrome-extension://{eid}" for eid in EXT_IDS] or ["*"]
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")
+IP_SALT = os.getenv("IP_SALT", "pepper")
 
-app = FastAPI(title="Summarize API", version="1.3.0")
+client = OpenAI()
 
-# Lock CORS to your extension in prod by setting EXT_ID in Render env
-EXT_ID = os.getenv("EXT_ID", "").strip()
-ALLOWED_ORIGINS = [f"chrome-extension://{EXT_ID}"] if EXT_ID else ["*"]
+app = FastAPI(title="summarize-selection")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
 
-# Simple in-memory cache (per instance)
-CACHE_TTL_S = 600
-_cache: dict[str, tuple[float, str]] = {}
+# ---- psycopg (binary) async pool ----
+from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import dict_row
 
-def cache_get(key: str) -> Optional[str]:
-    item = _cache.get(key)
-    if not item:
-        return None
-    ts, val = item
-    if time.time() - ts > CACHE_TTL_S:
-        _cache.pop(key, None)
-        return None
-    return val
+POOL: Optional[AsyncConnectionPool] = None
 
-def cache_set(key: str, value: str) -> None:
-    _cache[key] = (time.time(), value)
+DDL = """
+CREATE TABLE IF NOT EXISTS pings (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  user_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  ext_version TEXT,
+  ua TEXT,
+  ip_hash TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pings_ts ON pings (ts);
+CREATE INDEX IF NOT EXISTS idx_pings_user_ts ON pings (user_id, ts);
+CREATE INDEX IF NOT EXISTS idx_pings_action_ts ON pings (action, ts);
+"""
 
-# ---------- Models ----------
-Tone = Literal["precise", "casual", "bullet", "academic"]
+@app.on_event("startup")
+async def init_db():
+    global POOL
+    if not DATABASE_URL:
+        return
+    # Note: psycopg uses $PG* vars in the DSN; we pass DATABASE_URL directly.
+    POOL = AsyncConnectionPool(
+        conninfo=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        kwargs={"row_factory": dict_row},
+    )
+    async with POOL.connection() as conn:
+        async with conn.transaction():
+            await conn.execute(DDL)
 
+async def get_pool() -> AsyncConnectionPool:
+    if POOL is None:
+        raise HTTPException(500, "Database not initialized")
+    return POOL
+
+def require_admin(req: Request):
+    if req.headers.get("x-admin-token") != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+def hash_ip(ip: str) -> str:
+    return hashlib.sha256(f"{IP_SALT}:{ip}".encode()).hexdigest()
+
+# ---- Middleware ----
+@app.middleware("http")
+async def timing_header(request: Request, call_next):
+    t0 = time.time()
+    resp = await call_next(request)
+    resp.headers["X-Response-Time-ms"] = str(int((time.time() - t0) * 1000))
+    return resp
+
+# ---- Rate Limit ----
+_buckets: defaultdict[str, deque] = defaultdict(deque)
+
+def allow_ip(ip: str) -> bool:
+    now = time.time()
+    q = _buckets[ip]
+    while q and now - q[0] > WINDOW_SEC:
+        q.popleft()
+    if len(q) >= MAX_REQ_PER_MIN:
+        return False
+    q.append(now)
+    return True
+
+# ---- Models ----
 class SummarizeRequest(BaseModel):
-    text: str = Field(..., min_length=1)
-    tone: Tone = "precise"
-    maxSentences: int = Field(3, ge=1, le=10)
-    model: Optional[str] = None
-
-    @validator("text")
-    def trimmed(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("text cannot be empty")
-        return v
+    text: str = Field(min_length=1)
+    tone: str = Field(default="precise", pattern=r"^[a-zA-Z\- ]{1,32}$")
+    maxSentences: int = Field(default=3, ge=1, le=10)
 
 class SummarizeResponse(BaseModel):
     summary: str
 
-# ---------- Helpers ----------
-def tone_instruction(tone: Tone, n: int) -> str:
-    if tone == "bullet":
-        return f"Summarize the content in at most {n} concise bullet points."
-    return f"Summarize the content in at most {n} sentences with a {tone} tone."
+class Ping(BaseModel):
+    id: str
+    action: str = "summary"     # 'install' | 'successful_summary' | 'error' | 'summary'
+    ext_version: Optional[str] = None
 
-def chunk_text(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> List[str]:
-    paras = [p.strip() for p in text.split("\n") if p.strip()]
-    chunks: List[str] = []
-    buf = ""
-    for p in paras:
-        if len(buf) + len(p) + 1 <= max_chars:
-            buf = (buf + "\n" + p).strip()
-        else:
-            if buf:
-                chunks.append(buf)
-            if len(p) <= max_chars:
-                buf = p
-            else:
-                # very long single paragraph
-                for i in range(0, len(p), max_chars):
-                    piece = p[i : i + max_chars]
-                    if buf:
-                        chunks.append(buf)
-                        buf = ""
-                    chunks.append(piece)
-    if buf:
-        chunks.append(buf)
-    return chunks or [""]
+# ---- Utils ----
+def chunk(text: str, max_chars: int = 6000) -> List[str]:
+    t = text.strip()
+    if len(t) <= max_chars:
+        return [t]
+    parts: List[str] = []
+    start = 0
+    while start < len(t):
+        end = min(len(t), start + max_chars)
+        cut = max(t.rfind("\n\n", start, end), t.rfind(". ", start, end))
+        if cut == -1 or cut <= start + int(max_chars * 0.4):
+            cut = end
+        parts.append(t[start:cut].strip())
+        start = cut
+    return [p for p in parts if p]
 
-async def call_openai_with_timeout(prompt: str, model: str) -> str:
-    async def _call() -> str:
-        comp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a careful summarizer. Avoid adding facts not present."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        return comp.choices[0].message.content.strip()
+def summarize_chunk(txt: str, tone: str, max_sent: int) -> str:
+    prompt = (
+        f"Summarize the following text in at most {max_sent} sentences. "
+        f"Tone: {tone}. Focus on key facts. Avoid fluff.\n\nTEXT:\n{txt}"
+    )
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
-    try:
-        return await asyncio.wait_for(_call(), timeout=REQUEST_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Upstream model timed out")
-    except Exception as e:
-        msg = str(e)
-        if "insufficient_quota" in msg or "Rate limit" in msg:
-            raise HTTPException(status_code=429, detail="OpenAI quota or rate limit")
-        if "invalid_api_key" in msg.lower():
-            raise HTTPException(status_code=401, detail="OpenAI authentication failed")
-        raise HTTPException(status_code=502, detail="OpenAI upstream error")
-
-# ---------- Routes ----------
-@app.get("/health")
-async def health():
-    return {"ok": True, "model": DEFAULT_MODEL, "cache_size": len(_cache)}
+# ---- Routes ----
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "summarize-selection",
+        "docs": "/docs",
+        "analytics": "/analytics/now",
+        "dashboard": "/dashboard",
+    }
 
 @app.post("/summarize", response_model=SummarizeResponse)
-async def summarize(req: SummarizeRequest) -> SummarizeResponse:
-    model = req.model or DEFAULT_MODEL
-    instr = tone_instruction(req.tone, req.maxSentences)
+async def summarize(req: SummarizeRequest, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    if not allow_ip(ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
 
-    # cache key
-    digest_input = f"{req.tone}|{req.maxSentences}|{req.text}"
-    cache_key = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
-    cached = cache_get(cache_key)
-    if cached:
-        return SummarizeResponse(summary=cached)
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
 
-    parts = chunk_text(req.text)
+    try:
+        pieces = chunk(text)
+        if len(pieces) == 1:
+            out = summarize_chunk(pieces[0], req.tone, req.maxSentences)
+        else:
+            partials = [summarize_chunk(p, req.tone, req.maxSentences) for p in pieces]
+            stitched = "\n\n".join(partials)
+            out = summarize_chunk(
+                f"Combine and condense these partial summaries into at most {req.maxSentences} sentences:\n\n{stitched}",
+                req.tone,
+                req.maxSentences,
+            )
+        return {"summary": out or "(no summary produced)"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Summarization failed: {e}")
 
-    if len(parts) == 1:
-        prompt = f"{instr}\n\n---\n{parts[0]}"
-        out = await call_openai_with_timeout(prompt, model)
-        cache_set(cache_key, out)
-        return SummarizeResponse(summary=out)
+# ---- Ingest ----
+@app.post("/ping")
+async def ping(req: Ping, request: Request, pool: AsyncConnectionPool = Depends(get_pool)):
+    try:
+        ip = request.client.host or "0.0.0.0"
+        ua = request.headers.get("user-agent", "")
+        async with pool.connection() as conn:
+            await conn.execute(
+                "INSERT INTO pings (user_id, action, ext_version, ua, ip_hash) VALUES (%s, %s, %s, %s, %s)",
+                (req.id, req.action, req.ext_version, ua, hash_ip(ip)),
+            )
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, f"ping failed: {e}")
 
-    # Multi-stage: summarize chunks, then synthesize
-    partials: List[str] = []
-    for i, ch in enumerate(parts, start=1):
-        prompt = f"{instr}\n\n(Part {i} of {len(parts)})\n\n---\n{ch}"
-        partials.append(await call_openai_with_timeout(prompt, model))
+# ---- Aggregates ----
+async def fetchval(conn, sql: str, params: tuple = ()) -> int:
+    async with conn.cursor() as cur:
+        await cur.execute(sql, params)
+        row = await cur.fetchone()
+        return (row[0] if row and row[0] is not None else 0)
 
-    synthesis = textwrap.dedent(
-        f"""
-        {instr}
-        You are given partial summaries of several parts of a longer text.
-        Merge them into one cohesive summary. Remove redundancy.
+@app.get("/analytics/now")
+async def analytics_now(request: Request, pool: AsyncConnectionPool = Depends(get_pool)):
+    require_admin(request)
 
-        PARTIAL SUMMARIES:
-        {"".join(f"- {p}\n" for p in partials)}
-        """
-    ).strip()
+    now = datetime.utcnow()
+    one_min = now - timedelta(minutes=1)
+    five_min = now - timedelta(minutes=5)
+    day = now - timedelta(days=1)
 
-    final = await call_openai_with_timeout(synthesis, model)
-    cache_set(cache_key, final)
-    return SummarizeResponse(summary=final)
+    async with pool.connection() as conn:
+        lifetime_installs = await fetchval(conn,
+            "SELECT COUNT(DISTINCT user_id) FROM pings WHERE action='install'")
+        installs_24h = await fetchval(conn,
+            "SELECT COUNT(*) FROM (SELECT DISTINCT user_id FROM pings WHERE action='install' AND ts >= %s) t",
+            (day,))
+        active_5m = await fetchval(conn,
+            "SELECT COUNT(DISTINCT user_id) FROM pings WHERE action='successful_summary' AND ts >= %s",
+            (five_min,))
+        summaries_1m = await fetchval(conn,
+            "SELECT COUNT(*) FROM pings WHERE action='successful_summary' AND ts >= %s",
+            (one_min,))
+        summaries_5m = await fetchval(conn,
+            "SELECT COUNT(*) FROM pings WHERE action='successful_summary' AND ts >= %s",
+            (five_min,))
+        errors_5m = await fetchval(conn,
+            "SELECT COUNT(*) FROM pings WHERE action='error' AND ts >= %s",
+            (five_min,))
+        # version mix (24h)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COALESCE(ext_version,'unknown') v, COUNT(*) c FROM pings WHERE ts >= %s GROUP BY v ORDER BY c DESC",
+                (day,),
+            )
+            versions = [{"version": r[0], "count": r[1]} async for r in cur]
+
+    error_rate_5m = (errors_5m or 0) / max(1, (summaries_5m or 0) + (errors_5m or 0))
+
+    return JSONResponse({
+        "lifetime_installs": int(lifetime_installs or 0),
+        "installs_24h": int(installs_24h or 0),
+        "active_users_5m": int(active_5m or 0),
+        "summaries_per_min": int(summaries_1m or 0),
+        "summaries_5m": int(summaries_5m or 0),
+        "errors_5m": int(errors_5m or 0),
+        "error_rate_5m": round(error_rate_5m, 4),
+        "version_mix_24h": versions,
+        "as_of_utc": now.isoformat() + "Z"
+    })
+
+@app.get("/analytics")
+async def analytics_alias(request: Request, pool: AsyncConnectionPool = Depends(get_pool)):
+    return await analytics_now(request, pool)
+
+# ---- Dashboard ----
+DASHBOARD_HTML = """
+<!doctype html><meta charset="utf-8">
+<title>Summarize Sidekick – Live</title>
+<style>
+  body{font-family: system-ui,-apple-system,Segoe UI,Roboto; margin:24px;}
+  .grid{display:grid; grid-template-columns: repeat(3, minmax(220px,1fr)); gap:16px;}
+  .card{border:1px solid #e5e7eb; border-radius:12px; padding:16px;}
+  .k{color:#6b7280;font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+  .v{font-size:28px;font-weight:700;margin-top:6px}
+  .small{font-size:12px;color:#6b7280;margin-top:6px}
+</style>
+<div id="updated" class="small">loading…</div>
+<div class="grid">
+  <div class="card"><div class="k">Lifetime installs</div><div class="v" id="lifetime"></div></div>
+  <div class="card"><div class="k">Installs (24h)</div><div class="v" id="inst24"></div></div>
+  <div class="card"><div class="k">Active users (5m)</div><div class="v" id="active5"></div></div>
+  <div class="card"><div class="k">Summaries/min (live)</div><div class="v" id="spm"></div></div>
+  <div class="card"><div class="k">Summaries (5m)</div><div class="v" id="s5"></div></div>
+  <div class="card"><div class="k">Error rate (5m)</div><div class="v" id="err"></div></div>
+</div>
+<div class="card" style="margin-top:16px">
+  <div class="k">Version mix (24h)</div>
+  <ul id="ver"></ul>
+</div>
+<script>
+const TOKEN = localStorage.getItem("ADMIN_TOKEN") || prompt("Admin token:");
+if (TOKEN) localStorage.setItem("ADMIN_TOKEN", TOKEN);
+
+async function tick(){
+  try{
+    const r = await fetch("/analytics/now", {headers: {"x-admin-token": TOKEN}});
+    if(!r.ok){ document.getElementById('updated').innerText = "Unauthorized / bad token"; return; }
+    const d = await r.json();
+    const set = (id, val) => document.getElementById(id).innerText = val;
+    set('lifetime', d.lifetime_installs);
+    set('inst24', d.installs_24h);
+    set('active5', d.active_users_5m);
+    set('spm', d.summaries_per_min);
+    set('s5', d.summaries_5m);
+    set('err', (d.error_rate_5m*100).toFixed(1) + "%");
+    const ul = document.getElementById('ver'); ul.innerHTML = "";
+    (d.version_mix_24h || []).forEach(v => {
+      const li = document.createElement('li');
+      li.textContent = `${v.version}: ${v.count}`;
+      ul.appendChild(li);
+    });
+    document.getElementById('updated').innerText = "Updated " + new Date(d.as_of_utc).toLocaleTimeString();
+  }catch(e){
+    document.getElementById('updated').innerText = "Error: " + e.message;
+  }
+}
+tick(); setInterval(tick, 5000);
+</script>
+"""
+
+@app.get("/dashboard")
+async def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)
+
+# Run local:
+# uvicorn main:app --host 0.0.0.0 --port 8000
