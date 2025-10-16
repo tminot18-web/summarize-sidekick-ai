@@ -139,12 +139,18 @@ def hip(ip: str) -> str:
 
 @app.post("/ping")
 async def ping(req: Ping, request: Request, pool: AsyncConnectionPool = Depends(get_pool)):
+    action = (req.action or "").strip().lower()
+    if action in {"summary_success", "successful_summary"}:
+        action = "successful_summary"
+    elif action in {"summary_error", "error"}:
+        action = "error"
     ip = request.client.host or "0.0.0.0"
     ua = request.headers.get("user-agent", "")
+    ext_ver = req.ext_version
     async with pool.connection() as conn:
         await conn.execute(
             "INSERT INTO pings(user_id,action,ext_version,ua,ip_hash) VALUES (%s,%s,%s,%s,%s)",
-            (req.id, req.action, req.ext_version, ua, hip(ip)),
+            (req.id, action, ext_ver, ua, hip(ip)),
         )
     return {"ok": True}
 
@@ -158,22 +164,21 @@ async def fetchval(conn, sql: str, params: tuple = ()) -> int:
 async def analytics_now(request: Request, pool: AsyncConnectionPool = Depends(get_pool)):
     require_admin(request)
     now = datetime.utcnow()
+    d1 = now - timedelta(days=1)
     m1 = now - timedelta(minutes=1)
     m5 = now - timedelta(minutes=5)
-    d1 = now - timedelta(days=1)
     async with pool.connection() as conn:
-        lifetime = await fetchval(conn, "SELECT COUNT(DISTINCT user_id) FROM pings WHERE action='install'")
-        installs24 = await fetchval(conn, "SELECT COUNT(*) FROM (SELECT DISTINCT user_id FROM pings WHERE action='install' AND ts >= %s)t", (d1,))
+        lifetime = await fetchval(conn, "SELECT COUNT(*) FROM (SELECT user_id, MIN(ts) FROM pings GROUP BY user_id) t")
+        installs24 = await fetchval(conn, "SELECT COUNT(*) FROM (SELECT user_id, MIN(ts) first_seen FROM pings GROUP BY user_id) t WHERE t.first_seen >= %s", (d1,))
         active5 = await fetchval(conn, "SELECT COUNT(DISTINCT user_id) FROM pings WHERE action='successful_summary' AND ts >= %s", (m5,))
         s1 = await fetchval(conn, "SELECT COUNT(*) FROM pings WHERE action='successful_summary' AND ts >= %s", (m1,))
         s5 = await fetchval(conn, "SELECT COUNT(*) FROM pings WHERE action='successful_summary' AND ts >= %s", (m5,))
         e5 = await fetchval(conn, "SELECT COUNT(*) FROM pings WHERE action='error' AND ts >= %s", (m5,))
+        versions = []
         async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT COALESCE(ext_version,'unknown'), COUNT(*) FROM pings WHERE ts >= %s GROUP BY 1 ORDER BY 2 DESC",
-                (d1,),
-            )
-            versions = [{"version": r[0], "count": r[1]} async for r in cur]
+            await cur.execute("SELECT COALESCE(ext_version,'unknown'), COUNT(*) FROM pings WHERE ts >= %s GROUP BY 1 ORDER BY 2 DESC", (d1,))
+            async for r in cur:
+                versions.append({"version": r[0], "count": r[1]})
     er = (e5 or 0) / max(1, (s5 or 0) + (e5 or 0))
     return JSONResponse({
         "lifetime_installs": int(lifetime or 0),
@@ -224,3 +229,4 @@ tick();setInterval(tick,5000);
 @app.get("/dashboard")
 def dashboard():
     return HTMLResponse(DASHBOARD_HTML)
+
